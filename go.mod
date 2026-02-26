@@ -1,4 +1,4 @@
-module github.com/pennsieve/pennsieve-llm
+module github.com/pennsieve/pennsieve-go-llm
 
 go 1.25.3
 
