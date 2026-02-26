@@ -16,6 +16,12 @@ func ImageBlock(format, base64Data string) ContentBlock {
 	return ContentBlock{Type: "image", Format: format, Data: base64Data}
 }
 
+// DocumentBlock creates a document content block from base64-encoded data.
+// Supported formats: pdf, csv, txt, md, html, doc, docx, xls, xlsx.
+func DocumentBlock(name, format, base64Data string) ContentBlock {
+	return ContentBlock{Type: "document", Name: name, Format: format, Data: base64Data}
+}
+
 // UserMessage creates a user message with the given content blocks.
 func UserMessage(blocks ...ContentBlock) Message {
 	return Message{Role: "user", Content: blocks}
