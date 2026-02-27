@@ -37,10 +37,11 @@ func TestNewGovernor_Options(t *testing.T) {
 
 func TestNewGovernor_NotAvailable(t *testing.T) {
 	t.Setenv("LLM_GOVERNOR_FUNCTION", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
 
 	g := NewGovernor()
 	if g.Available() {
-		t.Error("expected Available() to be false when env var is empty")
+		t.Error("expected Available() to be false when no backend is configured")
 	}
 }
 
