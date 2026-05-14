@@ -118,20 +118,7 @@ type anthropicErrorResponse struct {
 }
 
 func (b *AnthropicBackend) Invoke(ctx context.Context, req *InvokeRequest) (*InvokeResponse, error) {
-	model := MapModel(req.Model)
-
-	maxTokens := req.MaxTokens
-	if maxTokens == 0 {
-		maxTokens = 1024
-	}
-
-	apiReq := anthropicRequest{
-		Model:       model,
-		MaxTokens:   maxTokens,
-		System:      req.System,
-		Temperature: req.Temperature,
-		Messages:    convertMessages(req.Messages),
-	}
+	apiReq := buildAnthropicRequestFromInvoke(req)
 
 	body, err := json.Marshal(apiReq)
 	if err != nil {
@@ -169,14 +156,36 @@ func (b *AnthropicBackend) Invoke(ctx context.Context, req *InvokeRequest) (*Inv
 	if err := json.Unmarshal(respBody, &apiResp); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal Anthropic response: %w", err)
 	}
+	return buildInvokeResponseFromAnthropic(&apiResp), nil
+}
 
+// buildAnthropicRequestFromInvoke converts the SDK's InvokeRequest into the
+// Anthropic Messages API request shape. Used by both AnthropicBackend (direct
+// to api.anthropic.com) and GovernorBackend (via SigV4 to the governor URL).
+func buildAnthropicRequestFromInvoke(req *InvokeRequest) anthropicRequest {
+	maxTokens := req.MaxTokens
+	if maxTokens == 0 {
+		maxTokens = 1024
+	}
+	return anthropicRequest{
+		Model:       MapModel(req.Model),
+		MaxTokens:   maxTokens,
+		System:      req.System,
+		Temperature: req.Temperature,
+		Messages:    convertMessages(req.Messages),
+	}
+}
+
+// buildInvokeResponseFromAnthropic converts an Anthropic Messages response
+// into the SDK's InvokeResponse. Drops content blocks we don't surface yet
+// (thinking, tool_use); keeps text blocks.
+func buildInvokeResponseFromAnthropic(apiResp *anthropicResponse) *InvokeResponse {
 	content := make([]ResponseContent, 0, len(apiResp.Content))
 	for _, block := range apiResp.Content {
 		if block.Type == "text" {
 			content = append(content, ResponseContent{Type: "text", Text: block.Text})
 		}
 	}
-
 	return &InvokeResponse{
 		Content: content,
 		Model:   apiResp.Model,
@@ -185,7 +194,7 @@ func (b *AnthropicBackend) Invoke(ctx context.Context, req *InvokeRequest) (*Inv
 			OutputTokens: apiResp.Usage.OutputTokens,
 		},
 		StopReason: apiResp.StopReason,
-	}, nil
+	}
 }
 
 func (b *AnthropicBackend) CheckBudget(_ context.Context, _ string) (*CheckBudgetResponse, error) {

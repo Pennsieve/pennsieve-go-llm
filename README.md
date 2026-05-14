@@ -45,7 +45,8 @@ The SDK reads two environment variables automatically:
 
 | Variable | Set by | Description |
 |----------|--------|-------------|
-| `LLM_GOVERNOR_FUNCTION` | Platform (ASL converter) | Governor Lambda function name |
+| `LLM_GOVERNOR_URL` | Platform (ASL converter) | Governor Function URL (HTTPS) |
+| `AWS_REGION` | Platform or default `us-east-1` | Region for SigV4 signing |
 | `EXECUTION_RUN_ID` | Platform (Step Functions) | Current workflow execution ID |
 
 Both are injected by the platform — processor authors don't need to set them.
@@ -188,12 +189,20 @@ if err != nil {
 ## Configuration Options
 
 ```go
-// Override function name (default: LLM_GOVERNOR_FUNCTION env var)
-gov := llm.NewGovernor(llm.WithFunctionName("custom-governor"))
+// Override governor URL (default: LLM_GOVERNOR_URL env var)
+gov := llm.NewGovernor(llm.WithURL("https://abc.lambda-url.us-east-1.on.aws"))
 
 // Override execution run ID (default: EXECUTION_RUN_ID env var)
 gov := llm.NewGovernor(llm.WithExecutionRunID("my-run-id"))
 
-// Provide a custom Lambda client (useful for testing)
-gov := llm.NewGovernor(llm.WithLambdaClient(myClient))
+// Provide a custom http.Client (useful for testing or tuned timeouts)
+gov := llm.NewGovernor(llm.WithGovernorHTTPClientOption(myClient))
 ```
+
+### Backend types
+
+- **GovernorBackend** (production) — talks HTTPS to a deployed Pennsieve LLM Governor, SigV4-signed against the "lambda" service. Selected when `LLM_GOVERNOR_URL` is set or `WithURL(...)` is used.
+- **AnthropicBackend** (local dev) — talks directly to `api.anthropic.com` with an API key. Selected when `ANTHROPIC_API_KEY` is set and no governor URL.
+- **MockBackend** (tests) — returns canned responses. Selected when neither env var is set.
+
+> **Migration note**: this SDK previously had a `LambdaBackend` that used direct `lambda:Invoke`. That path was removed when the governor migrated to Lambda Function URL response streaming. All production callers now use SigV4-signed HTTPS via `GovernorBackend`. The replacement is API-compatible at the `Governor.Ask` / `Governor.Invoke` level; only the constructor options changed (`WithFunctionName` → `WithURL`, `WithLambdaClient` removed).

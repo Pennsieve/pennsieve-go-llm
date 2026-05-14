@@ -2,64 +2,61 @@ package llm
 
 import (
 	"context"
+	"net/http"
 	"os"
-
-	"github.com/aws/aws-sdk-go-v2/service/lambda"
 )
 
 // Governor is a client for the Pennsieve LLM platform.
 type Governor struct {
-	functionName   string
+	governorURL    string
 	executionRunID string
-	lambdaClient   *lambda.Client
+	httpClient     *http.Client
 	backend        Backend
 }
 
 // GovernorOption configures a Governor instance.
 type GovernorOption func(*Governor)
 
-// WithFunctionName overrides the governor function name.
-// By default, it is read from the LLM_GOVERNOR_FUNCTION env var.
-func WithFunctionName(name string) GovernorOption {
-	return func(g *Governor) {
-		g.functionName = name
-	}
+// WithURL overrides the governor URL. By default it is read from the
+// LLM_GOVERNOR_URL env var.
+func WithURL(u string) GovernorOption {
+	return func(g *Governor) { g.governorURL = u }
 }
 
 // WithExecutionRunID sets a default execution run ID for all requests.
 // Can be overridden per-request via InvokeRequest.ExecutionRunID.
 func WithExecutionRunID(id string) GovernorOption {
-	return func(g *Governor) {
-		g.executionRunID = id
-	}
+	return func(g *Governor) { g.executionRunID = id }
 }
 
-// WithLambdaClient provides a custom Lambda client (useful for testing).
-func WithLambdaClient(client *lambda.Client) GovernorOption {
-	return func(g *Governor) {
-		g.lambdaClient = client
-	}
+// WithGovernorHTTPClientOption (Governor-level) provides a custom http.Client
+// for the governor backend (useful for testing or for tuned timeouts).
+// Distinct from WithGovernorHTTPClient which is a backend-level option.
+func WithGovernorHTTPClientOption(c *http.Client) GovernorOption {
+	return func(g *Governor) { g.httpClient = c }
 }
 
 // WithBackend provides an explicit backend, overriding automatic selection.
 func WithBackend(b Backend) GovernorOption {
-	return func(g *Governor) {
-		g.backend = b
-	}
+	return func(g *Governor) { g.backend = b }
 }
 
 // NewGovernor creates a new Governor client.
 //
 // Backend is selected automatically based on environment:
 //   - If a backend is provided via WithBackend, it is used directly.
-//   - If LLM_GOVERNOR_FUNCTION is set (or WithFunctionName is used), a LambdaBackend is used.
-//   - If ANTHROPIC_API_KEY is set, an AnthropicBackend is used for local development.
+//   - If LLM_GOVERNOR_URL is set (or WithURL is used), a GovernorBackend is
+//     used. AWS credentials are loaded from the default chain for SigV4.
+//   - If ANTHROPIC_API_KEY is set, an AnthropicBackend is used for local
+//     development against api.anthropic.com.
 //   - Otherwise, a MockBackend is used for testing.
 //
-// The AWS Lambda client is created lazily on first use if not provided.
+// If GovernorBackend setup fails (e.g. AWS config cannot load), the
+// constructor falls back to MockBackend rather than panicking. Callers
+// can check g.Available() to detect this.
 func NewGovernor(opts ...GovernorOption) *Governor {
 	g := &Governor{
-		functionName:   os.Getenv("LLM_GOVERNOR_FUNCTION"),
+		governorURL:    os.Getenv("LLM_GOVERNOR_URL"),
 		executionRunID: os.Getenv("EXECUTION_RUN_ID"),
 	}
 	for _, opt := range opts {
@@ -68,8 +65,20 @@ func NewGovernor(opts ...GovernorOption) *Governor {
 
 	if g.backend == nil {
 		switch {
-		case g.functionName != "":
-			g.backend = NewLambdaBackend(g.functionName, g.lambdaClient)
+		case g.governorURL != "":
+			govOpts := []GovernorBackendOption{WithGovernorURL(g.governorURL)}
+			if g.httpClient != nil {
+				govOpts = append(govOpts, WithGovernorHTTPClient(g.httpClient))
+			}
+			b, err := NewGovernorBackend(context.Background(), govOpts...)
+			if err != nil {
+				// Fall back to mock so callers can still construct a Governor
+				// in environments where AWS config isn't available. They can
+				// detect this via g.Available() == false.
+				g.backend = NewMockBackend()
+			} else {
+				g.backend = b
+			}
 		case os.Getenv("ANTHROPIC_API_KEY") != "":
 			g.backend = NewAnthropicBackend()
 		default:
@@ -81,7 +90,7 @@ func NewGovernor(opts ...GovernorOption) *Governor {
 }
 
 // Available returns true if the governor is configured with a real backend
-// (Lambda or Anthropic). Returns false for the mock backend.
+// (governor or direct Anthropic). Returns false for the mock backend.
 func (g *Governor) Available() bool {
 	_, isMock := g.backend.(*MockBackend)
 	return !isMock

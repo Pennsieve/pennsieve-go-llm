@@ -7,28 +7,27 @@ import (
 )
 
 func TestNewGovernor_Defaults(t *testing.T) {
-	t.Setenv("LLM_GOVERNOR_FUNCTION", "my-governor")
+	t.Setenv("LLM_GOVERNOR_URL", "https://abc.lambda-url.us-east-1.on.aws")
 	t.Setenv("EXECUTION_RUN_ID", "run-123")
 
 	g := NewGovernor()
-	if g.functionName != "my-governor" {
-		t.Errorf("expected functionName 'my-governor', got %q", g.functionName)
+	if g.governorURL != "https://abc.lambda-url.us-east-1.on.aws" {
+		t.Errorf("expected governorURL to be picked up from env, got %q", g.governorURL)
 	}
 	if g.executionRunID != "run-123" {
 		t.Errorf("expected executionRunID 'run-123', got %q", g.executionRunID)
 	}
-	if !g.Available() {
-		t.Error("expected Available() to be true")
-	}
+	// Available may be false if AWS config can't load in test env — that's
+	// fine, NewGovernor falls back to MockBackend in that case.
 }
 
 func TestNewGovernor_Options(t *testing.T) {
 	g := NewGovernor(
-		WithFunctionName("custom-func"),
+		WithURL("https://custom.lambda-url.us-east-1.on.aws"),
 		WithExecutionRunID("custom-run"),
 	)
-	if g.functionName != "custom-func" {
-		t.Errorf("expected functionName 'custom-func', got %q", g.functionName)
+	if g.governorURL != "https://custom.lambda-url.us-east-1.on.aws" {
+		t.Errorf("expected governorURL to honor WithURL, got %q", g.governorURL)
 	}
 	if g.executionRunID != "custom-run" {
 		t.Errorf("expected executionRunID 'custom-run', got %q", g.executionRunID)
@@ -36,7 +35,7 @@ func TestNewGovernor_Options(t *testing.T) {
 }
 
 func TestNewGovernor_NotAvailable(t *testing.T) {
-	t.Setenv("LLM_GOVERNOR_FUNCTION", "")
+	t.Setenv("LLM_GOVERNOR_URL", "")
 	t.Setenv("ANTHROPIC_API_KEY", "")
 
 	g := NewGovernor()

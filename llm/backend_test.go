@@ -296,7 +296,7 @@ func TestMockBackend_ListModels(t *testing.T) {
 // --- Backend selection tests ---
 
 func TestGovernor_NoEnvSelectsMock(t *testing.T) {
-	t.Setenv("LLM_GOVERNOR_FUNCTION", "")
+	t.Setenv("LLM_GOVERNOR_URL", "")
 	t.Setenv("ANTHROPIC_API_KEY", "")
 
 	g := NewGovernor()
@@ -308,31 +308,8 @@ func TestGovernor_NoEnvSelectsMock(t *testing.T) {
 	}
 }
 
-func TestGovernor_LambdaEnvSelectsLambda(t *testing.T) {
-	t.Setenv("LLM_GOVERNOR_FUNCTION", "my-func")
-	t.Setenv("ANTHROPIC_API_KEY", "")
-
-	g := NewGovernor()
-	if _, ok := g.backend.(*LambdaBackend); !ok {
-		t.Errorf("expected LambdaBackend, got %T", g.backend)
-	}
-	if !g.Available() {
-		t.Error("expected Available() to be true for LambdaBackend")
-	}
-}
-
-func TestGovernor_FunctionNameArgSelectsLambda(t *testing.T) {
-	t.Setenv("LLM_GOVERNOR_FUNCTION", "")
-	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
-
-	g := NewGovernor(WithFunctionName("explicit-func"))
-	if _, ok := g.backend.(*LambdaBackend); !ok {
-		t.Errorf("expected LambdaBackend, got %T", g.backend)
-	}
-}
-
 func TestGovernor_AnthropicEnvSelectsAnthropic(t *testing.T) {
-	t.Setenv("LLM_GOVERNOR_FUNCTION", "")
+	t.Setenv("LLM_GOVERNOR_URL", "")
 	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
 
 	g := NewGovernor()
@@ -345,7 +322,7 @@ func TestGovernor_AnthropicEnvSelectsAnthropic(t *testing.T) {
 }
 
 func TestGovernor_ExplicitBackendOverridesEnv(t *testing.T) {
-	t.Setenv("LLM_GOVERNOR_FUNCTION", "my-func")
+	t.Setenv("LLM_GOVERNOR_URL", "https://x.lambda-url.us-east-1.on.aws")
 	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
 
 	mock := NewMockBackend()
@@ -356,7 +333,7 @@ func TestGovernor_ExplicitBackendOverridesEnv(t *testing.T) {
 }
 
 func TestGovernor_MockBackendAsk(t *testing.T) {
-	t.Setenv("LLM_GOVERNOR_FUNCTION", "")
+	t.Setenv("LLM_GOVERNOR_URL", "")
 	t.Setenv("ANTHROPIC_API_KEY", "")
 
 	g := NewGovernor()
