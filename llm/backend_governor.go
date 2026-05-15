@@ -116,8 +116,25 @@ func NewGovernorBackend(ctx context.Context, opts ...GovernorBackendOption) (*Go
 }
 
 // Invoke sends a non-streaming chat request via POST /v1/messages.
+//
+// Note on model IDs: the governor forwards calls to Bedrock and expects the
+// full Bedrock inference-profile ID (e.g. "us.anthropic.claude-opus-4-7").
+// We do NOT call MapModel() here — that helper is for the AnthropicBackend
+// which talks directly to api.anthropic.com and needs the Anthropic short
+// name. Pass req.Model through unchanged so the governor's allow-list
+// exact-match check finds the entry.
 func (b *GovernorBackend) Invoke(ctx context.Context, req *InvokeRequest) (*InvokeResponse, error) {
-	anthReq := buildAnthropicRequestFromInvoke(req)
+	maxTokens := req.MaxTokens
+	if maxTokens == 0 {
+		maxTokens = 1024
+	}
+	anthReq := anthropicRequest{
+		Model:       req.Model, // full Bedrock ID, NOT MapModel(req.Model)
+		MaxTokens:   maxTokens,
+		System:      req.System,
+		Temperature: req.Temperature,
+		Messages:    convertMessages(req.Messages),
+	}
 	body, err := json.Marshal(anthReq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal Anthropic request: %w", err)
