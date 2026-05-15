@@ -1,199 +1,101 @@
-# pennsieve-llm
+# pennsieve-go-llm
 
-Go SDK for invoking LLM models from Pennsieve compute node processors.
+Thin Go configuration helper for the Pennsieve LLM Governor.
 
-This package wraps the LLM Governor Lambda, handling serialization, error parsing, and providing a clean API for common patterns. It works with both ECS and Lambda processors.
+Returns a pre-configured `*anthropic.Client` (from [anthropic-sdk-go](https://github.com/anthropics/anthropic-sdk-go)) pointed at the Pennsieve LLM Governor with SigV4 auth and the `x-execution-run-id` header wired up. Streaming, tool use, prompt caching — every Anthropic SDK feature works because you're using the real Anthropic SDK.
 
-## Install
+## Installation
 
 ```bash
-go get github.com/pennsieve/pennsieve-llm
+go get github.com/pennsieve/pennsieve-go-llm
 ```
 
-## Quick Start
+Requires Go 1.24+.
+
+## Quick start
 
 ```go
-package main
-
 import (
     "context"
     "fmt"
-    "log"
 
-    "github.com/pennsieve/pennsieve-llm/llm"
+    "github.com/anthropics/anthropic-sdk-go"
+    "github.com/pennsieve/pennsieve-go-llm/llm"
 )
 
 func main() {
     ctx := context.Background()
-    gov := llm.NewGovernor()
-
-    // Check if LLM access is available on this compute node
-    if !gov.Available() {
-        log.Println("LLM access not enabled on this compute node")
-        return
-    }
-
-    answer, err := gov.Ask(ctx, llm.ModelHaiku45, "What is mitosis?")
+    gov, err := llm.New(ctx)  // auto-configures from $LLM_GOVERNOR_URL + AWS creds
     if err != nil {
-        log.Fatal(err)
+        panic(err)
     }
-    fmt.Println(answer)
+
+    resp, err := gov.Client().Messages.New(ctx, anthropic.MessageNewParams{
+        Model:     anthropic.F(llm.ModelSonnet45),
+        MaxTokens: anthropic.F(int64(1024)),
+        Messages: anthropic.F([]anthropic.MessageParam{
+            anthropic.NewUserMessage(anthropic.NewTextBlock("Hello, world!")),
+        }),
+    })
+    if err != nil { panic(err) }
+    fmt.Println(resp.Content[0].Text)
 }
 ```
 
-The SDK reads two environment variables automatically:
+The object returned by `gov.Client()` **is** `*anthropic.Client`. Everything in the [anthropic-sdk-go docs](https://github.com/anthropics/anthropic-sdk-go) applies.
 
-| Variable | Set by | Description |
-|----------|--------|-------------|
-| `LLM_GOVERNOR_FUNCTION` | Platform (ASL converter) | Governor Lambda function name |
-| `EXECUTION_RUN_ID` | Platform (Step Functions) | Current workflow execution ID |
+## Configuration
 
-Both are injected by the platform — processor authors don't need to set them.
+| Env var | Purpose |
+|---|---|
+| `LLM_GOVERNOR_URL` | Governor Function URL (platform-injected) |
+| `EXECUTION_RUN_ID` | Cost attribution; attached as `x-execution-run-id` header (platform-injected) |
+| `AWS_REGION` | SigV4 signing region (default `us-east-1`) |
 
-## Usage
-
-### Simple text prompt
-
-```go
-gov := llm.NewGovernor()
-
-answer, err := gov.Ask(ctx, llm.ModelHaiku45, "Explain PCR in one paragraph.")
-```
-
-### Text prompt with system instruction
+Options:
 
 ```go
-answer, err := gov.AskWithSystem(ctx, llm.ModelSonnet46,
-    "You are a biomedical NLP assistant. Return JSON only.",
-    "Extract all gene names from this abstract: ...",
+gov, err := llm.New(ctx,
+    llm.WithURL("https://abc.lambda-url.us-east-1.on.aws"),
+    llm.WithExecutionRunID("run-123"),
+    llm.WithRegion("us-east-1"),
 )
 ```
 
-### Ask about a file on EFS
+## Governor-specific endpoints
+
+`CheckBudget` and `ListModels` query Pennsieve-specific endpoints (not part of the Anthropic API):
 
 ```go
-answer, err := gov.AskAboutFile(ctx, llm.ModelSonnet46,
-    "Summarize the key findings in this paper.",
-    "workdir/run-1/output/paper.pdf",
-)
+b, _ := gov.CheckBudget(ctx)
+fmt.Printf("$%.2f remaining this %s\n", b.PeriodRemainingUsd, b.BudgetPeriod)
+
+models, _ := gov.ListModels(ctx)
+for _, m := range models.Models { fmt.Println(m.ModelID, m.Status) }
 ```
 
-The governor reads the file from EFS, detects the format from the extension, and converts it to the appropriate Bedrock content block. Supported formats: PDF, CSV, TXT, MD, HTML, DOC, DOCX, XLS, XLSX, PNG, JPEG, GIF, WEBP.
+## Testing
 
-### Full control with InvokeRequest
+Use `httptest.NewServer` + `llm.WithHTTPClient(ts.Client())` to bypass SigV4 against a fake governor.
 
-```go
-resp, err := gov.Invoke(ctx, &llm.InvokeRequest{
-    Model:       llm.ModelHaiku45,
-    System:      "Extract diagnosis codes as a JSON array.",
-    MaxTokens:   2048,
-    Temperature: 0.0,
-    Messages: []llm.Message{
-        llm.UserMessage(
-            llm.TextBlock("Extract ICD-10 codes from this clinical note:"),
-            llm.FileBlock("input/run-1/src-1/note.txt"),
-        ),
-    },
-    ExecutionBudgetUsd: 1.00,
-})
-if err != nil {
-    log.Fatal(err)
-}
+For chat (`Messages.New`) tests, mock at the http.Transport level — see the anthropic-sdk-go testing docs.
 
-fmt.Println(resp.Text())
-fmt.Printf("Cost: $%.4f\n", resp.Usage.EstimatedCostUsd)
-fmt.Printf("Budget remaining: $%.2f\n", resp.BudgetRemaining.PeriodRemainingUsd)
-```
+## Model ID constants
 
-### Multi-turn conversation
+| Constant | Bedrock inference profile ID |
+|---|---|
+| `ModelHaiku45` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` |
+| `ModelSonnet4` | `us.anthropic.claude-sonnet-4-20250514-v1:0` |
+| `ModelSonnet45` | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` |
+| `ModelSonnet46` | `us.anthropic.claude-sonnet-4-6` |
+| `ModelOpus47` | `us.anthropic.claude-opus-4-7` |
 
-```go
-resp, err := gov.Invoke(ctx, &llm.InvokeRequest{
-    Model: llm.ModelHaiku45,
-    Messages: []llm.Message{
-        llm.UserMessage(llm.TextBlock("What is the capital of France?")),
-        llm.AssistantMessage(llm.TextBlock("The capital of France is Paris.")),
-        llm.UserMessage(llm.TextBlock("What is its population?")),
-    },
-})
-```
+`us.*` keeps inference in US AWS regions — HIPAA-friendly default.
 
-### Check budget
+## Migration from v0.x
 
-```go
-budget, err := gov.CheckBudget(ctx)
-if err != nil {
-    log.Fatal(err)
-}
-fmt.Printf("Period: %s, Used: $%.4f, Remaining: $%.2f\n",
-    budget.BudgetPeriod, budget.PeriodUsedUsd, budget.PeriodRemainingUsd)
-```
+The SDK pivoted to "thin configuration wrapper" — it returns the real `*anthropic.Client` rather than wrapping it with parallel types. The previous `Governor.Ask`, `Governor.Invoke`, and `Governor.AskAboutFile` convenience methods are gone. Use `gov.Client().Messages.New(...)` directly. The migration cost is offset by gaining direct access to streaming, tool use, prompt caching, and every future Anthropic SDK feature.
 
-### List available models
+## License
 
-```go
-models, err := gov.ListModels(ctx)
-if err != nil {
-    log.Fatal(err)
-}
-for _, m := range models.Models {
-    fmt.Printf("%s: %s\n", m.ModelID, m.Status)
-}
-```
-
-## Error Handling
-
-The SDK returns typed errors for governor-specific failures:
-
-```go
-resp, err := gov.Ask(ctx, llm.ModelHaiku45, "Hello")
-if err != nil {
-    if ge, ok := llm.IsGovernorError(err); ok {
-        switch {
-        case ge.IsBudgetExceeded():
-            fmt.Printf("Budget exhausted. Remaining: $%.2f\n",
-                ge.BudgetRemaining.PeriodRemainingUsd)
-        case ge.IsModelNotAllowed():
-            fmt.Printf("Model not allowed. Available: %v\n", ge.AllowedModels)
-        case ge.IsProviderNotAllowed():
-            fmt.Println("Provider not approved for this deployment mode")
-        case ge.IsModelNotEnabled():
-            fmt.Println("Enable the model in the AWS Bedrock console")
-        case ge.IsThrottled():
-            fmt.Printf("Rate limited. Retry after %d seconds\n", ge.RetryAfterSec)
-        }
-    }
-    log.Fatal(err)
-}
-```
-
-## Available Models
-
-| Constant | Model ID | Best for |
-|----------|----------|----------|
-| `llm.ModelHaiku45` | `anthropic.claude-haiku-4-5-20251001` | Fast, low-cost tasks: classification, extraction, simple Q&A |
-| `llm.ModelSonnet46` | `anthropic.claude-sonnet-4-6-20250514` | Complex reasoning, analysis, summarization |
-| `llm.ModelSonnet4` | `anthropic.claude-sonnet-4-20250514` | Same as Sonnet 4.6 (alias) |
-
-## Content Block Builders
-
-| Builder | Type | Description |
-|---------|------|-------------|
-| `llm.TextBlock(text)` | `text` | Plain text content |
-| `llm.FileBlock(path)` | `efs_document` | EFS file (auto-detected format) |
-| `llm.ImageBlock(format, data)` | `image` | Base64-encoded image |
-| `llm.UserMessage(blocks...)` | — | User message from content blocks |
-| `llm.AssistantMessage(blocks...)` | — | Assistant message from content blocks |
-
-## Configuration Options
-
-```go
-// Override function name (default: LLM_GOVERNOR_FUNCTION env var)
-gov := llm.NewGovernor(llm.WithFunctionName("custom-governor"))
-
-// Override execution run ID (default: EXECUTION_RUN_ID env var)
-gov := llm.NewGovernor(llm.WithExecutionRunID("my-run-id"))
-
-// Provide a custom Lambda client (useful for testing)
-gov := llm.NewGovernor(llm.WithLambdaClient(myClient))
-```
+MIT
