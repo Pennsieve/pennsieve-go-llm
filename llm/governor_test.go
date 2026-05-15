@@ -2,76 +2,166 @@ package llm
 
 import (
 	"context"
-	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
 )
 
-func TestNewGovernor_Defaults(t *testing.T) {
-	t.Setenv("LLM_GOVERNOR_URL", "https://abc.lambda-url.us-east-1.on.aws")
-	t.Setenv("EXECUTION_RUN_ID", "run-123")
+// stubCredentialsProvider returns canned AWS credentials for tests so we
+// don't need a real credential chain.
+type stubCredentialsProvider struct{}
 
-	g := NewGovernor()
-	if g.governorURL != "https://abc.lambda-url.us-east-1.on.aws" {
-		t.Errorf("expected governorURL to be picked up from env, got %q", g.governorURL)
-	}
-	if g.executionRunID != "run-123" {
-		t.Errorf("expected executionRunID 'run-123', got %q", g.executionRunID)
-	}
-	// Available may be false if AWS config can't load in test env — that's
-	// fine, NewGovernor falls back to MockBackend in that case.
+func (stubCredentialsProvider) Retrieve(_ context.Context) (aws.Credentials, error) {
+	return aws.Credentials{
+		AccessKeyID:     "AKIA-TEST",
+		SecretAccessKey: "secret-test",
+		SessionToken:    "session-test",
+	}, nil
 }
 
-func TestNewGovernor_Options(t *testing.T) {
-	g := NewGovernor(
-		WithURL("https://custom.lambda-url.us-east-1.on.aws"),
-		WithExecutionRunID("custom-run"),
-	)
-	if g.governorURL != "https://custom.lambda-url.us-east-1.on.aws" {
-		t.Errorf("expected governorURL to honor WithURL, got %q", g.governorURL)
-	}
-	if g.executionRunID != "custom-run" {
-		t.Errorf("expected executionRunID 'custom-run', got %q", g.executionRunID)
-	}
-}
-
-func TestNewGovernor_NotAvailable(t *testing.T) {
+func TestNew_MissingURL(t *testing.T) {
 	t.Setenv("LLM_GOVERNOR_URL", "")
-	t.Setenv("ANTHROPIC_API_KEY", "")
-
-	g := NewGovernor()
-	if g.Available() {
-		t.Error("expected Available() to be false when no backend is configured")
+	_, err := New(context.Background())
+	if err == nil {
+		t.Error("expected error when governor URL is missing")
 	}
 }
 
-func TestInvokeResponse_Text(t *testing.T) {
-	resp := &InvokeResponse{
-		Content: []ResponseContent{
-			{Type: "text", Text: "Hello "},
-			{Type: "text", Text: "world"},
-		},
+func TestNew_WithURL(t *testing.T) {
+	t.Setenv("EXECUTION_RUN_ID", "run-test")
+	g, err := New(context.Background(),
+		WithURL("https://test.lambda-url.us-east-1.on.aws"),
+		WithCredentials(stubCredentialsProvider{}),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if resp.Text() != "Hello world" {
-		t.Errorf("expected 'Hello world', got %q", resp.Text())
+	if g.URL() != "https://test.lambda-url.us-east-1.on.aws" {
+		t.Errorf("URL not preserved: %q", g.URL())
+	}
+	if g.ExecutionRunID() != "run-test" {
+		t.Errorf("ExecutionRunID not picked up from env: %q", g.ExecutionRunID())
+	}
+	if g.Client() == nil {
+		t.Error("expected Client() to return non-nil anthropic.Client")
 	}
 }
 
-func TestInvokeResponse_TextEmpty(t *testing.T) {
-	resp := &InvokeResponse{}
-	if resp.Text() != "" {
-		t.Errorf("expected empty string, got %q", resp.Text())
+func TestNew_URLTrailingSlashStripped(t *testing.T) {
+	g, err := New(context.Background(),
+		WithURL("https://test.lambda-url.us-east-1.on.aws/"),
+		WithCredentials(stubCredentialsProvider{}),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if g.URL() != "https://test.lambda-url.us-east-1.on.aws" {
+		t.Errorf("trailing slash should be stripped, got %q", g.URL())
 	}
 }
 
-func TestGovernorError(t *testing.T) {
-	err := &GovernorError{
-		Code: "budget_exceeded",
-		Msg:  "daily budget exceeded",
-	}
+func TestCheckBudget_AgainstFakeServer(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/budget" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"budgetPeriod": "daily",
+			"periodBudgetUsd": 5.0,
+			"periodUsedUsd": 1.25,
+			"periodRemainingUsd": 3.75
+		}`))
+	}))
+	defer ts.Close()
 
-	if err.Error() != "governor error [budget_exceeded]: daily budget exceeded" {
-		t.Errorf("unexpected error string: %s", err.Error())
+	g, err := New(context.Background(),
+		WithURL(ts.URL),
+		WithHTTPClient(ts.Client()),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
+	b, err := g.CheckBudget(context.Background())
+	if err != nil {
+		t.Fatalf("CheckBudget failed: %v", err)
+	}
+	if b.BudgetPeriod != "daily" || b.PeriodUsedUsd != 1.25 || b.PeriodRemainingUsd != 3.75 {
+		t.Errorf("CheckBudget response not parsed correctly: %+v", b)
+	}
+}
+
+func TestCheckBudget_ErrorResponse(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"invalid_request","message":"bad input"}`))
+	}))
+	defer ts.Close()
+
+	g, err := New(context.Background(),
+		WithURL(ts.URL),
+		WithHTTPClient(ts.Client()),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	_, err = g.CheckBudget(context.Background())
+	if err == nil {
+		t.Fatal("expected error from 400 response")
+	}
+	ge, ok := IsGovernorError(err)
+	if !ok {
+		t.Errorf("expected GovernorError, got %T: %v", err, err)
+	}
+	if ge.Code != "invalid_request" {
+		t.Errorf("expected code=invalid_request, got %q", ge.Code)
+	}
+}
+
+func TestListModels_AgainstFakeServer(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"models": [
+				{"modelId": "us.anthropic.claude-sonnet-4-5-20250929-v1:0", "status": "available"},
+				{"modelId": "us.anthropic.claude-opus-4-7", "status": "available"}
+			]
+		}`))
+	}))
+	defer ts.Close()
+
+	g, err := New(context.Background(),
+		WithURL(ts.URL),
+		WithHTTPClient(ts.Client()),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	resp, err := g.ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("ListModels failed: %v", err)
+	}
+	if len(resp.Models) != 2 {
+		t.Errorf("expected 2 models, got %d", len(resp.Models))
+	}
+}
+
+func TestEFSDocument(t *testing.T) {
+	block := EFSDocument("workdir/paper.pdf")
+	if block["type"] != "efs_document" {
+		t.Errorf("type should be efs_document, got %v", block["type"])
+	}
+	if block["path"] != "workdir/paper.pdf" {
+		t.Errorf("path should be workdir/paper.pdf, got %v", block["path"])
+	}
+}
+
+func TestGovernorError_Predicates(t *testing.T) {
+	err := &GovernorError{Code: "budget_exceeded", Msg: "over"}
 	if !err.IsBudgetExceeded() {
 		t.Error("expected IsBudgetExceeded() to be true")
 	}
@@ -81,74 +171,22 @@ func TestGovernorError(t *testing.T) {
 }
 
 func TestIsGovernorError(t *testing.T) {
-	err := &GovernorError{Code: "model_not_allowed", Msg: "not allowed"}
-
-	ge, ok := IsGovernorError(err)
-	if !ok {
-		t.Fatal("expected IsGovernorError to return true")
+	plain := http.ErrAbortHandler
+	if _, ok := IsGovernorError(plain); ok {
+		t.Error("non-GovernorError should not match")
 	}
-	if !ge.IsModelNotAllowed() {
-		t.Error("expected IsModelNotAllowed() to be true")
-	}
-}
-
-func TestIsGovernorError_NotGovernorError(t *testing.T) {
-	_, ok := IsGovernorError(context.DeadlineExceeded)
-	if ok {
-		t.Error("expected IsGovernorError to return false for non-GovernorError")
+	gov := &GovernorError{Code: "x", Msg: "y"}
+	got, ok := IsGovernorError(gov)
+	if !ok || got != gov {
+		t.Errorf("expected to match, got %v %v", got, ok)
 	}
 }
 
-func TestMessageBuilder(t *testing.T) {
-	msg := UserMessage(
-		TextBlock("Summarize this"),
-		FileBlock("workdir/run-1/output/report.pdf"),
-	)
-	if msg.Role != "user" {
-		t.Errorf("expected role 'user', got %q", msg.Role)
-	}
-	if len(msg.Content) != 2 {
-		t.Fatalf("expected 2 content blocks, got %d", len(msg.Content))
-	}
-	if msg.Content[0].Type != "text" {
-		t.Errorf("expected first block type 'text', got %q", msg.Content[0].Type)
-	}
-	if msg.Content[1].Type != "efs_document" {
-		t.Errorf("expected second block type 'efs_document', got %q", msg.Content[1].Type)
-	}
-}
-
-func TestInvokeRequest_Serialization(t *testing.T) {
-	req := &InvokeRequest{
-		Action:         "invoke",
-		Model:          ModelHaiku45,
-		ExecutionRunID: "run-abc",
-		MaxTokens:      512,
-		Messages: []Message{
-			UserMessage(TextBlock("Hello")),
-		},
-	}
-
-	data, err := json.Marshal(req)
-	if err != nil {
-		t.Fatalf("failed to marshal: %v", err)
-	}
-
-	var parsed InvokeRequest
-	if err := json.Unmarshal(data, &parsed); err != nil {
-		t.Fatalf("failed to unmarshal: %v", err)
-	}
-
-	if parsed.Model != ModelHaiku45 {
-		t.Errorf("expected model %q, got %q", ModelHaiku45, parsed.Model)
-	}
-	if parsed.ExecutionRunID != "run-abc" {
-		t.Errorf("expected executionRunId 'run-abc', got %q", parsed.ExecutionRunID)
-	}
-	if len(parsed.Messages) != 1 {
-		t.Fatalf("expected 1 message, got %d", len(parsed.Messages))
-	}
-	if parsed.Messages[0].Content[0].Text != "Hello" {
-		t.Errorf("expected text 'Hello', got %q", parsed.Messages[0].Content[0].Text)
+func TestModelConstants(t *testing.T) {
+	models := []string{ModelHaiku45, ModelSonnet4, ModelSonnet45, ModelSonnet46, ModelOpus47}
+	for _, m := range models {
+		if len(m) < 13 || m[:13] != "us.anthropic." {
+			t.Errorf("model %q should start with us.anthropic.", m)
+		}
 	}
 }

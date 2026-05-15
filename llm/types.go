@@ -1,70 +1,10 @@
 package llm
 
-// InvokeRequest is the request payload for an LLM invocation.
-type InvokeRequest struct {
-	Action             string    `json:"action"`
-	Model              string    `json:"model"`
-	Messages           []Message `json:"messages"`
-	System             string    `json:"system,omitempty"`
-	MaxTokens          int32     `json:"maxTokens,omitempty"`
-	Temperature        float32   `json:"temperature,omitempty"`
-	ExecutionRunID     string    `json:"executionRunId"`
-	ExecutionBudgetUsd float64   `json:"executionBudgetUsd,omitempty"`
-}
+// Types for governor-specific endpoints (CheckBudget, ListModels) and error
+// envelopes. Chat request/response types are NOT defined here — those come
+// from github.com/anthropics/anthropic-sdk-go, returned via Governor.Client().
 
-// Message represents a conversation message with one or more content blocks.
-type Message struct {
-	Role    string         `json:"role"`
-	Content []ContentBlock `json:"content"`
-}
-
-// ContentBlock represents a single content block within a message.
-type ContentBlock struct {
-	// Type is the block type: "text", "efs_document", "image", or "document".
-	Type string `json:"type"`
-
-	// Text content (for type "text").
-	Text string `json:"text,omitempty"`
-
-	// EFS file path (for type "efs_document"). Relative to compute node data dir.
-	Path string `json:"path,omitempty"`
-
-	// Format hint (for type "efs_document", "image", "document").
-	Format string `json:"format,omitempty"`
-
-	// Base64-encoded data (for type "image" or "document").
-	Data string `json:"data,omitempty"`
-
-	// Media type (for type "image" or "document").
-	MediaType string `json:"mediaType,omitempty"`
-
-	// Document name (for type "document").
-	Name string `json:"name,omitempty"`
-}
-
-// InvokeResponse is the response from a successful LLM invocation.
-type InvokeResponse struct {
-	Content         []ResponseContent `json:"content"`
-	Model           string            `json:"model"`
-	Usage           UsageInfo         `json:"usage"`
-	BudgetRemaining BudgetInfo        `json:"budgetRemaining"`
-	StopReason      string            `json:"stopReason,omitempty"`
-}
-
-// ResponseContent represents a content block in the model's response.
-type ResponseContent struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
-}
-
-// UsageInfo holds token usage and cost information.
-type UsageInfo struct {
-	InputTokens      int64   `json:"inputTokens"`
-	OutputTokens     int64   `json:"outputTokens"`
-	EstimatedCostUsd float64 `json:"estimatedCostUsd"`
-}
-
-// BudgetInfo holds remaining budget information.
+// BudgetInfo holds budget tracking data.
 type BudgetInfo struct {
 	BudgetPeriod          string  `json:"budgetPeriod"`
 	PeriodBudgetUsd       float64 `json:"periodBudgetUsd"`
@@ -75,7 +15,7 @@ type BudgetInfo struct {
 	ExecutionRemainingUsd float64 `json:"executionRemainingUsd,omitempty"`
 }
 
-// CheckBudgetResponse is the response from a check-budget action.
+// CheckBudgetResponse is the response from GET /v1/budget.
 type CheckBudgetResponse struct {
 	BudgetPeriod          string  `json:"budgetPeriod"`
 	PeriodBudgetUsd       float64 `json:"periodBudgetUsd"`
@@ -86,19 +26,22 @@ type CheckBudgetResponse struct {
 	ExecutionRemainingUsd float64 `json:"executionRemainingUsd,omitempty"`
 }
 
-// ModelInfo represents a model in the list-models response.
+// ModelInfo represents a model in the ListModels response.
 type ModelInfo struct {
 	ModelID string `json:"modelId"`
 	Status  string `json:"status"`
 	Hint    string `json:"hint,omitempty"`
 }
 
-// ListModelsResponse is the response from a list-models action.
+// ListModelsResponse is the response from GET /v1/models.
 type ListModelsResponse struct {
 	Models []ModelInfo `json:"models"`
 }
 
-// ErrorResponse is returned by the governor on errors.
+// ErrorResponse is the governor's error envelope (returned by any
+// non-Anthropic endpoint like /v1/budget or /v1/models on failure). Chat
+// errors come back through the anthropic.Client as anthropic.APIError —
+// use anthropic-sdk-go's exception hierarchy for those.
 type ErrorResponse struct {
 	Error           string      `json:"error"`
 	Message         string      `json:"message"`
