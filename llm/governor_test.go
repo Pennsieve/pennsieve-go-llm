@@ -21,25 +21,26 @@ func (stubCredentialsProvider) Retrieve(_ context.Context) (aws.Credentials, err
 	}, nil
 }
 
-func TestNew_MissingURL(t *testing.T) {
-	t.Setenv("LLM_GOVERNOR_URL", "")
+func TestNew_MissingFunctionName(t *testing.T) {
+	t.Setenv("LLM_GOVERNOR_FUNCTION_NAME", "")
 	_, err := New(context.Background())
 	if err == nil {
-		t.Error("expected error when governor URL is missing")
+		t.Error("expected error when no governor function name is configured")
 	}
 }
 
-func TestNew_WithURL(t *testing.T) {
+func TestNew_WithFunctionName(t *testing.T) {
+	t.Setenv("AWS_REGION", "us-east-1")
 	t.Setenv("EXECUTION_RUN_ID", "run-test")
 	g, err := New(context.Background(),
-		WithURL("https://test.lambda-url.us-east-1.on.aws"),
+		WithFunctionName("llm-governor-acct-dev-node1"),
 		WithCredentials(stubCredentialsProvider{}),
 	)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if g.URL() != "https://test.lambda-url.us-east-1.on.aws" {
-		t.Errorf("URL not preserved: %q", g.URL())
+	if g.FunctionName() != "llm-governor-acct-dev-node1" {
+		t.Errorf("FunctionName not preserved: %q", g.FunctionName())
 	}
 	if g.ExecutionRunID() != "run-test" {
 		t.Errorf("ExecutionRunID not picked up from env: %q", g.ExecutionRunID())
@@ -49,16 +50,15 @@ func TestNew_WithURL(t *testing.T) {
 	}
 }
 
-func TestNew_URLTrailingSlashStripped(t *testing.T) {
-	g, err := New(context.Background(),
-		WithURL("https://test.lambda-url.us-east-1.on.aws/"),
-		WithCredentials(stubCredentialsProvider{}),
-	)
+func TestNew_FunctionNameFromEnv(t *testing.T) {
+	t.Setenv("AWS_REGION", "us-east-1")
+	t.Setenv("LLM_GOVERNOR_FUNCTION_NAME", "llm-governor-from-env")
+	g, err := New(context.Background(), WithCredentials(stubCredentialsProvider{}))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if g.URL() != "https://test.lambda-url.us-east-1.on.aws" {
-		t.Errorf("trailing slash should be stripped, got %q", g.URL())
+	if g.FunctionName() != "llm-governor-from-env" {
+		t.Errorf("FunctionName not read from env: %q", g.FunctionName())
 	}
 }
 
@@ -79,7 +79,7 @@ func TestCheckBudget_AgainstFakeServer(t *testing.T) {
 	defer ts.Close()
 
 	g, err := New(context.Background(),
-		WithURL(ts.URL),
+		WithBaseURL(ts.URL),
 		WithHTTPClient(ts.Client()),
 	)
 	if err != nil {
@@ -103,7 +103,7 @@ func TestCheckBudget_ErrorResponse(t *testing.T) {
 	defer ts.Close()
 
 	g, err := New(context.Background(),
-		WithURL(ts.URL),
+		WithBaseURL(ts.URL),
 		WithHTTPClient(ts.Client()),
 	)
 	if err != nil {
@@ -135,7 +135,7 @@ func TestListModels_AgainstFakeServer(t *testing.T) {
 	defer ts.Close()
 
 	g, err := New(context.Background(),
-		WithURL(ts.URL),
+		WithBaseURL(ts.URL),
 		WithHTTPClient(ts.Client()),
 	)
 	if err != nil {

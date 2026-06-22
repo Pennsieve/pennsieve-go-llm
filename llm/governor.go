@@ -1,11 +1,20 @@
 // Package llm is a thin configuration helper for the Pennsieve LLM Governor.
 //
 // The package returns a pre-configured *anthropic.Client (from
-// github.com/anthropics/anthropic-sdk-go) pointed at the governor URL with
-// SigV4 auth and the x-execution-run-id header wired up. Users interact
-// with the official Anthropic SDK directly — streaming, tool use, prompt
-// caching, extended thinking, every future Anthropic feature works
-// without any wrapping on our side.
+// github.com/anthropics/anthropic-sdk-go) whose transport dispatches every
+// request to the governor via lambda:InvokeWithResponseStream (wrapping each
+// request in a LambdaFunctionURLRequest envelope), with the x-execution-run-id
+// header wired up. There is no public Function URL — all governor traffic
+// stays on private AWS APIs, so this works in isolated/no-internet (compliant)
+// VPCs too. Users interact with the official Anthropic SDK directly —
+// streaming, tool use, prompt caching, extended thinking, every future
+// Anthropic feature works without any wrapping on our side.
+//
+// The governor is reached by Lambda function name ($LLM_GOVERNOR_FUNCTION_NAME),
+// which the Pennsieve platform injects into every LLM-enabled processor. This
+// is the canonical, provider-neutral, all-deployment-modes path; off-the-shelf
+// HTTP tools (Claude Code, langchain) instead use the in-task sidecar via
+// $ANTHROPIC_BASE_URL.
 package llm
 
 import (
@@ -23,12 +32,20 @@ import (
 	"github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/lambda"
 )
 
 const defaultRegion = "us-east-1"
 
+// lambdaInvokeBaseURL is the placeholder base URL handed to the Anthropic SDK
+// when the governor is reached via lambda:Invoke. The lambda transport ignores
+// the host entirely (it dispatches by function name) and uses only the request
+// path/query, so the value just has to be a syntactically valid URL.
+const lambdaInvokeBaseURL = "http://governor.lambda.invoke"
+
 // Governor is a configuration helper for talking to the Pennsieve LLM Governor.
 type Governor struct {
+	functionName   string
 	url            string
 	executionRunID string
 	region         string
@@ -40,8 +57,16 @@ type Governor struct {
 // Option configures a Governor at construction time.
 type Option func(*Governor)
 
-// WithURL overrides the governor URL. Default: $LLM_GOVERNOR_URL.
-func WithURL(u string) Option {
+// WithFunctionName overrides the governor Lambda function name reached via
+// lambda:InvokeWithResponseStream. Default: $LLM_GOVERNOR_FUNCTION_NAME.
+func WithFunctionName(name string) Option {
+	return func(g *Governor) { g.functionName = name }
+}
+
+// WithBaseURL overrides the Anthropic SDK base URL. Only meaningful together
+// with WithHTTPClient (e.g. pointing the SDK at an httptest server in unit
+// tests); in production the lambda transport ignores the host.
+func WithBaseURL(u string) Option {
 	return func(g *Governor) { g.url = u }
 }
 
@@ -71,12 +96,14 @@ func WithHTTPClient(c *http.Client) Option {
 	return func(g *Governor) { g.httpClient = c }
 }
 
-// New constructs a Governor. The governor URL is required ($LLM_GOVERNOR_URL
-// or WithURL); without it, returns an error. For tests that don't need a
-// real governor, use WithHTTPClient to point at an httptest.NewServer.
+// New constructs a Governor. The governor is reached by Lambda function name
+// ($LLM_GOVERNOR_FUNCTION_NAME or WithFunctionName) via
+// lambda:InvokeWithResponseStream; without one, returns an error. For tests
+// that don't need a real governor, use WithHTTPClient (+ WithBaseURL) to point
+// the Anthropic SDK at an httptest.NewServer.
 func New(ctx context.Context, opts ...Option) (*Governor, error) {
 	g := &Governor{
-		url:            os.Getenv("LLM_GOVERNOR_URL"),
+		functionName:   os.Getenv("LLM_GOVERNOR_FUNCTION_NAME"),
 		executionRunID: os.Getenv("EXECUTION_RUN_ID"),
 		region:         os.Getenv("AWS_REGION"),
 	}
@@ -86,34 +113,36 @@ func New(ctx context.Context, opts ...Option) (*Governor, error) {
 	if g.region == "" {
 		g.region = defaultRegion
 	}
-	if g.url == "" {
-		return nil, fmt.Errorf("governor URL is required (set LLM_GOVERNOR_URL or use WithURL)")
+
+	switch {
+	case g.httpClient != nil:
+		// Explicit transport injection (tests / advanced use). Use the
+		// provided client + base URL as-is; no lambda wiring.
+		if g.url == "" {
+			g.url = lambdaInvokeBaseURL
+		}
+	case g.functionName != "":
+		// Canonical path: dispatch through lambda:InvokeWithResponseStream.
+		lam, err := g.newLambdaClient(ctx)
+		if err != nil {
+			return nil, err
+		}
+		g.httpClient = &http.Client{
+			Transport: &lambdaInvokeTransport{client: lam, functionName: g.functionName},
+			Timeout:   15 * time.Minute,
+		}
+		g.url = lambdaInvokeBaseURL
+	default:
+		return nil, fmt.Errorf("no governor configured: set $LLM_GOVERNOR_FUNCTION_NAME (or use WithFunctionName / WithHTTPClient)")
 	}
 	g.url = strings.TrimRight(g.url, "/")
 
-	// Build the http.Client. If caller provided their own, use it as-is
-	// (no SigV4 added — caller is responsible). Otherwise build one with
-	// SigV4 signing from the default AWS credential chain.
-	if g.httpClient == nil {
-		if g.creds == nil {
-			cfg, err := config.LoadDefaultConfig(ctx)
-			if err != nil {
-				return nil, fmt.Errorf("load AWS config: %w", err)
-			}
-			g.creds = cfg.Credentials
-			if g.region == defaultRegion && cfg.Region != "" {
-				g.region = cfg.Region
-			}
-		}
-		g.httpClient = newSigV4HTTPClient(ctx, g.creds, g.region, 15*time.Minute)
-	}
-
 	// Build the underlying anthropic.Client. We pass a placeholder API key
-	// because the SDK requires one; the real auth is SigV4 attached via
-	// the http.Client's Transport.
+	// because the SDK requires one; the real auth is the IAM identity of the
+	// lambda:Invoke call (or whatever the injected http.Client provides).
 	clientOpts := []option.RequestOption{
 		option.WithBaseURL(g.url),
-		option.WithAPIKey("placeholder-using-sigv4-instead"),
+		option.WithAPIKey("placeholder-governor-handles-auth"),
 		option.WithHTTPClient(g.httpClient),
 	}
 	if g.executionRunID != "" {
@@ -122,6 +151,20 @@ func New(ctx context.Context, opts ...Option) (*Governor, error) {
 	g.client = anthropic.NewClient(clientOpts...)
 
 	return g, nil
+}
+
+// newLambdaClient builds the AWS Lambda client used by the invoke transport,
+// honoring an explicit region and credentials provider when set.
+func (g *Governor) newLambdaClient(ctx context.Context) (*lambda.Client, error) {
+	cfgOpts := []func(*config.LoadOptions) error{config.WithRegion(g.region)}
+	if g.creds != nil {
+		cfgOpts = append(cfgOpts, config.WithCredentialsProvider(g.creds))
+	}
+	cfg, err := config.LoadDefaultConfig(ctx, cfgOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("load AWS config: %w", err)
+	}
+	return lambda.NewFromConfig(cfg), nil
 }
 
 // Client returns the underlying *anthropic.Client. Use this for all chat
@@ -135,8 +178,13 @@ func (g *Governor) Client() *anthropic.Client {
 	return &g.client
 }
 
-// URL returns the configured governor URL.
+// URL returns the Anthropic SDK base URL. For the lambda-invoke transport this
+// is a placeholder; the transport dispatches by function name.
 func (g *Governor) URL() string { return g.url }
+
+// FunctionName returns the governor Lambda function name reached via
+// lambda:Invoke (empty when an explicit HTTP client was injected).
+func (g *Governor) FunctionName() string { return g.functionName }
 
 // ExecutionRunID returns the execution run ID attached to every request.
 func (g *Governor) ExecutionRunID() string { return g.executionRunID }
